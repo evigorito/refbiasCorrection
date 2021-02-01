@@ -91,7 +91,6 @@ class DataFiles(object):
         else:
             self.bam_sort_filename = self.bam_filename
 
-        #self.initial_AI_filename = self.prefix + ".initial.AI.pickle"
         self.initial_AI_filename = self.prefix + ".initial.AI.txt"
         sys.stderr.write("reading reads from:\n  %s\n" %
                          self.bam_sort_filename)
@@ -115,7 +114,6 @@ class DataFiles(object):
             sys.stderr.write("  %s\n" % (self.fastq_single_filename))
 
         self.input_bam = pysam.AlignmentFile(self.bam_sort_filename, "rb")
-        #self.initial_AI_pickle = open(self.initial_AI_filename, "wb")
         self.initial_AI_txt = open(self.initial_AI_filename, "w+")
        
         sys.stderr.write("  %s\n  " % self.initial_AI_filename)
@@ -359,7 +357,7 @@ def generate_reads2(reads,  pair_snp_read_pos, pair_snp_idx, ref_alleles, alt_al
         
   # shared SNPs among reads, avoid double-counting
     for i in range(len(pair_snp_read_pos)):    
-        if len(pair_snp_read_pos[i]) != 0:
+        if len(pair_snp_read_pos[i]) != 0:          
             for x in range(len(pair_snp_read_pos[i])):
                 idx = pair_snp_read_pos[i][x]-1
                 if reads[i][idx] == ref_alleles[i][0][x].decode("utf-8"):  # index 0 is to unlist
@@ -482,11 +480,11 @@ def write_pair_fastq(fastq_file1, fastq_file2, orig_read1, orig_read2,
                           (name, rev_seq, name, rev_q))                       
 
 
-
 def filter_reads(files, base_qual=BASEQ_DEFAULT):
     cur_chrom = None
     cur_tid = None
     seen_chrom = set([])
+    seen_chrom_tab = set([])
 
     snp_tab = snptable2.SNPTable()
     read_stats = ReadStats()
@@ -495,7 +493,9 @@ def filter_reads(files, base_qual=BASEQ_DEFAULT):
     read_count = 0
 
     # Dic of snp_tab objects to collect AI across all chromosomes
-    dic = {}
+    columns=[ "CHROM","POS",  "REF", "ALT", "NREF", "NALT"]
+    files.initial_AI_txt.write(' '.join(columns) + '\n')
+    files.initial_AI_txt.close()
 
     for read in files.input_bam:
         read_count += 1
@@ -519,9 +519,9 @@ def filter_reads(files, base_qual=BASEQ_DEFAULT):
                                  "reads on this chromosome\n" %
                                  len(read_pair_cache))
                 read_stats.discard_missing_pair += len(read_pair_cache)
-            read_pair_cache = {}
-            cache_size = 0
-            read_count = 0
+                read_pair_cache = {}
+                cache_size = 0
+                read_count = 0
 
             if cur_chrom in seen_chrom:
                 # sanity check that input bam file is sorted
@@ -532,7 +532,7 @@ def filter_reads(files, base_qual=BASEQ_DEFAULT):
             sys.stderr.write("starting chromosome %s\n" % cur_chrom)
 
             # use text files from SNP dir
-            
+
             #snp_filename = "%s/%s.snps.txt.gz" % (files.snp_dir, cur_chrom)
             try:
                 snp_filename = glob.glob(files.snp_dir + "/*[!0-9]"+ cur_chrom + "[!0-9]*" )[0]
@@ -541,13 +541,28 @@ def filter_reads(files, base_qual=BASEQ_DEFAULT):
                                  "assuming no SNPs for this chromosome\n" %
                                  cur_chrom)
                 continue
+
+             # make df to save for a chromosome after we have seen all the reads and before opening next table, check for snp_tab populated
+
+            if cur_tid is not None and len(snp_tab.snp_pos):
+                DF = pd.DataFrame(np.hstack((snp_tab.snp_pos[:,None])), columns=["POS"]) 
+                DF['CHROM'] =  tab_chrom
+                DF["REF"] = snp_tab.snp_allele1.astype('U13')
+                DF["ALT"] = snp_tab.snp_allele2.astype('U13')
+                DF['NREF'] = snp_tab.snp_na1
+                DF['NALT'] = snp_tab.snp_na2
+                DF.set_index(["CHROM", "POS"], inplace = True)
+                with open(files.initial_AI_filename, 'a') as f:
+                    DF.to_csv(f, header=False, index=True, sep=" ")
+
+                seen_chrom_tab.add(tab_chrom)
             
             sys.stderr.write("reading SNPs from file '%s'\n" % snp_filename)
             snp_tab.read_file(snp_filename)
 
-            # add snp_tab to dic, key is chromosome, make shallow copy to allow for updating columns in snp_tab within chromosome
-            dic[cur_chrom] = copy.copy(snp_tab)
-            
+            # keep track of the chromosome seen by snp_tab
+            tab_chrom=cur_chrom
+
             sys.stderr.write("processing reads\n")
 
         if read.is_secondary:
@@ -588,21 +603,16 @@ def filter_reads(files, base_qual=BASEQ_DEFAULT):
                     else:
                         read1 = read_pair_cache[read.qname]
                         read2 = read
-                    del read_pair_cache[read.qname]
-                    cache_size -= 1
+                        del read_pair_cache[read.qname]
+                        cache_size -= 1
 
                     if read2.next_reference_start != read1.reference_start:
                         sys.stderr.write("WARNING: read pair positions "
                                          "do not match for pair %s\n" %
                                          read.qname)
-                    else:
-                        # if 24000567 in read1.get_reference_positions() or 24000567 in read2.get_reference_positions():
-                        #     print(read1.qname)
-                        #     break
-                        # # if read.qname == 'ERR188315.10988241':
-                        #     break   
+                    else: 
                         process_paired_read(read1, read2, read_stats, files, snp_tab, base_qual)
-                        
+
 
                 else:
                     # we need to wait for next pair
@@ -628,34 +638,24 @@ def filter_reads(files, base_qual=BASEQ_DEFAULT):
 
     read_stats.write(sys.stderr)
 
-    # process dic into data frame for saving
-    df = pd.DataFrame(columns=["POS",  "CHROM", "REF", "ALT", "NREF", "NALT"])
-    for key in dic:  
-        tempDF = pd.DataFrame(np.hstack((dic[key].snp_pos[:,None])), columns=["POS"]) 
-        tempDF['CHROM'] =  key
-        tempDF["REF"] = dic[key].snp_allele1.astype('U13')
-        tempDF["ALT"] = dic[key].snp_allele2.astype('U13')
-        tempDF['NREF'] = dic[key].snp_na1
-        tempDF['NALT'] = dic[key].snp_na2
-          
-        df = df.append(tempDF)
-    df.set_index(["CHROM", "POS"], inplace = True)
-    df.sort_index(inplace=True)
-    
-    
-    #df.to_pickle(files.initial_AI_pickle)
-    df.to_csv(files.initial_AI_txt, sep=" ", index=True)
+    # save last snp_tab object output if it has not been saved above (when tab_chrom is not in seen_chrom_tab I didnt save the last snp_tab object)
 
-
+    if tab_chrom not in seen_chrom_tab:
+        DF = pd.DataFrame(np.hstack((snp_tab.snp_pos[:,None])), columns=["POS"]) 
+        DF['CHROM'] =  tab_chrom
+        DF["REF"] = snp_tab.snp_allele1.astype('U13')
+        DF["ALT"] = snp_tab.snp_allele2.astype('U13')
+        DF['NREF'] = snp_tab.snp_na1
+        DF['NALT'] = snp_tab.snp_na2
+        DF.set_index(["CHROM", "POS"], inplace = True)
+        with open(files.initial_AI_filename, 'a') as f:
+            DF.to_csv(f, header=False, index=True, sep=" ")
 
 def slice_read(read, indices):
     """slice a read by an array of indices"""
     return "".join(np.array(list(read))[indices])
 
 
-
-
-    
 
 def process_paired_read(read1, read2, read_stats, files,
                         snp_tab, base_qual=BASEQ_DEFAULT):
@@ -692,10 +692,7 @@ def process_paired_read(read1, read2, read_stats, files,
             # dont overlap ref or alt allele and base quality below BASEQ
             
             if len(snp_idx) > 0:
-                # ref_alleles = snp_tab.snp_allele1[snp_idx]
-                # alt_alleles = snp_tab.snp_allele2[snp_idx]
-                # read_seqs = generate_reads(read.query_sequence, snp_read_pos,
-                #                            ref_alleles, alt_alleles)
+                
                 ref_alleles.append([snp_tab.snp_allele1[snp_idx]])
                 alt_alleles.append([snp_tab.snp_allele2[snp_idx]])
                 genome_pos.append([snp_tab.snp_pos[snp_idx]])
@@ -732,8 +729,7 @@ def process_paired_read(read1, read2, read_stats, files,
             return
 
         # if new_reads == "yes":
-        #     return new_reads
-            
+        #     return new_reads   
         # write read pair to fastqs for remapping and to bam  for initial AI
         write_pair_fastq(files.fastq1, files.fastq2, read1, read2, new_reads, files)
         
@@ -817,24 +813,6 @@ if __name__ == '__main__':
          base_qual=options.base_qual,
          output_dir=options.output_dir,
          snp_dir=options.snp_dir)
-
-
-# bam_filenames = "/mrc-bsu/scratch/ev250/EGEUV1/quant/refbias/inputs/bam/HG00096.chrom22.MapUnique.bam"
-# is_sorted=True
-# is_paired_end =True
-# output_dir="/mrc-bsu/scratch/ev250/EGEUV1/quant/refbias"
-# snp_dir="/mrc-bsu/scratch/ev250/EGEUV1/quant/refbias/inputs/fSNP"
-# base_qual = 10
-
-##Single reads
-
-# bam_filenames="/mrc-bsu/scratch/ev250/psoriasis/STAR/SRR1146254/Aligned.sortedByCoord.out.bam"
-# is_sorted=True
-# is_paired_end =False
-# output_dir="/mrc-bsu/scratch/ev250/psoriasis/refbias"
-# snp_dir="/mrc-bsu/scratch/ev250/psoriasis/refbias/inputs/fSNP"
-# base_qual = 10
-
 
 
 

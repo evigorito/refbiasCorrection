@@ -18,7 +18,7 @@ import util
 
 #importlib.reload(snptable2)
 
-
+BASEQ_DEFAULT = 10
 
 class DataFiles(object):
     """Object to hold names and filehandles for all input / output 
@@ -224,6 +224,13 @@ def parse_options():
                         help=('Indicates that the input BAM file'
                               ' is coordinate-sorted (default '
                               'is False).'))
+
+    parser.add_argument("--base_qual", type=int, default=BASEQ_DEFAULT,
+                        help="The threshold for base quality "
+                        " to count a read "
+                        "(default=%d). Bases overlapping SNPs with lower "
+                        "quality than BASEQ_DEFAULT are not considered" %
+                        BASEQ_DEFAULT)
     
     parser.add_argument("--output_dir", default=None,
                         help="Directory to write output files to. If not "
@@ -247,43 +254,43 @@ def parse_options():
     return options
 
 
-# def filter_count_ref_alt_matches(read, read_stats, snp_tab, snp_idx, read_pos):
+def filter_count_ref_alt_matches(read, read_stats, snp_tab, snp_idx, read_pos):
     
-#     #base_idx = [i for i in range(len(base_q)) if base_q[i] >= base_qual]
+    #base_idx = [i for i in range(len(base_q)) if base_q[i] >= base_qual]
 
-#     # update based on qual
-#     snp_idx = [snp_idx[x] for x in base_idx]
-#     snp_read_pos = [read_pos[x] for x in base_idx]
+    # update based on qual
+    snp_idx = [snp_idx[x] for x in base_idx]
+    snp_read_pos = [read_pos[x] for x in base_idx]
     
 
-#     ref_alleles = snp_tab.snp_allele1[snp_idx]
-#     alt_alleles = snp_tab.snp_allele2[snp_idx]
+    ref_alleles = snp_tab.snp_allele1[snp_idx]
+    alt_alleles = snp_tab.snp_allele2[snp_idx]
 
-#     to_rem = []
+    to_rem = []
     
-#     for i in range(len(snp_idx)):
-#         ref = ref_alleles[i].decode("utf-8")
-#         alt = alt_alleles[i].decode("utf-8")
+    for i in range(len(snp_idx)):
+        ref = ref_alleles[i].decode("utf-8")
+        alt = alt_alleles[i].decode("utf-8")
         
-#         if ref == read.query_sequence[snp_read_pos[i]-1]:
-#             # read matches reference allele
-#             read_stats.ref_count += 1
-#         elif alt == read.query_sequence[snp_read_pos[i]-1]:
-#             # read matches non-reference allele
-#             read_stats.alt_count += 1
-#         else:
-#             # read matches neither ref nor other
-#             read_stats.other_count += 1
-#             to_rem.append(i)
+        if ref == read.query_sequence[snp_read_pos[i]-1]:
+            # read matches reference allele
+            read_stats.ref_count += 1
+        elif alt == read.query_sequence[snp_read_pos[i]-1]:
+            # read matches non-reference allele
+            read_stats.alt_count += 1
+        else:
+            # read matches neither ref nor other
+            read_stats.other_count += 1
+            to_rem.append(i)
 
-#     if len(to_rem):
-#         for i in sorted(to_rem, reverse=True): # remove in descending order so indices are not affected
-#             del snp_idx[i]
-#             del snp_read_pos[i]
-#             #del base_q[i]
+    if len(to_rem):
+        for i in sorted(to_rem, reverse=True): # remove in descending order so indices are not affected
+            del snp_idx[i]
+            del snp_read_pos[i]
+            #del base_q[i]
             
 
-#     return snp_idx, snp_read_pos #, base_q
+    return snp_idx, snp_read_pos, base_q
 
 
 
@@ -297,8 +304,6 @@ def count_reads(reads,  pair_snp_read_pos, pair_snp_idx, ref_alleles, alt_allele
     # paired reads only
     if len(snp_read_pos) == 2:
         for i in range(len(snp_read_pos)):
-            # first check if the same snp is in both reads and if so if it has the same allele, otherwise discard read
-            # get the indices of the SNP indices that are in both reads
             idx_idxs = np.nonzero(np.in1d(pair_snp_idx[i], pair_snp_idx[(i+1) % 2]))[0]
             # now, use the indices in idx_idxs to get the relevant snp positions
             # and convert positions to indices
@@ -375,6 +380,7 @@ def filter_reads(files):
     cur_chrom = None
     cur_tid = None
     seen_chrom = set([])
+    seen_chrom_tab = set([])
 
     snp_tab = snptable2.SNPTable()
     read_stats = ReadStats()
@@ -382,49 +388,19 @@ def filter_reads(files):
     cache_size = 0
     read_count = 0
 
-    # Dic of snp_tab objects to collect AI across all chromosomes
-    dic = {}
-
+    # Data frame to collect AI across all chromosomes, add header
+    columns=[ "CHROM","POS",  "REF", "ALT", "NREF", "NALT"]
+    files.post_remapping_AI_txt.write(' '.join(columns) + '\n')
+    files.post_remapping_AI_txt.close()
+    
     for read in files.input_bam:
         read_count += 1
-        # if (read_count % 100000) == 0:
-        #     sys.stderr.write("\nread_count: %d\n" % read_count)
-        #     sys.stderr.write("cache_size: %d\n" % cache_size)
-
-        # TODO: need to change this to use new pysam API calls
-        # but need to check pysam version for backward compatibility
-
-        # if read.qname == "SRR1146233.1284476.1.135131-135209":
-        #     break
         if read.tid == -1:
             # unmapped read
             read_stats.discard_unmapped += 1
             continue
 
         if (cur_tid is None) or (read.tid != cur_tid):
-            # when a read is "fake"  (read name: orginal_name.chrom.pos-pos, name can have "." ) check whether it matches to the same chromosome and positions as original, otherwise discard
-            l = str.split(read.qname, sep=".")         
-            if len(l) >= 3 and "-" in l[-1]:
-                coord = str.split(l[-1], sep="-")
-                if l[-2] != read.reference_name:
-                    read_stats.discard_different_chromosome += 1
-                    continue             
-                lpos = [int(x) for x in coord]
-                if files.is_paired: ## input of paired reads
-                    if not read.is_paired:
-                        continue
-                    if not read.is_proper_pair:
-                        continue            
-                
-                    if read.pos+1 < lpos[0] or read.pos+1 > lpos[1]:
-                        read_stats.discard_different_position += 1
-                        continue
-                    
-                else: ## single end
-                                      
-                    if read.pos+1 != lpos[0]: # single read not matching to original position
-                        read_stats.discard_different_position += 1
-                        continue
                 
             # this is a new chromosome
             cur_chrom = files.input_bam.getrname(read.tid)
@@ -455,14 +431,52 @@ def filter_reads(files):
                              "assuming no SNPs for this chromosome\n" %
                                  cur_chrom)
                 continue
+
+             # make df to save for a chromosome after we have seen all the reads and before opening next table, check for snp_tab populated
+
+            if cur_tid is not None and len(snp_tab.snp_pos):
+                DF = pd.DataFrame(np.hstack((snp_tab.snp_pos[:,None])), columns=["POS"]) 
+                DF['CHROM'] =  tab_chrom
+                DF["REF"] = snp_tab.snp_allele1.astype('U13')
+                DF["ALT"] = snp_tab.snp_allele2.astype('U13')
+                DF['NREF'] = snp_tab.snp_na1
+                DF['NALT'] = snp_tab.snp_na2
+                DF.set_index(["CHROM", "POS"], inplace = True)
+                with open(files.post_remapping_AI_filename, 'a') as f:
+                    DF.to_csv(f, header=False, index=True, sep=" ")
+
+                seen_chrom_tab.add(tab_chrom)
             
             sys.stderr.write("reading SNPs from file '%s'\n" % snp_filename)
             snp_tab.read_file(snp_filename)
 
-            # add snp_tab to dic, key is crhomosome
-            dic[cur_chrom] = copy.copy(snp_tab)
+            # keep track of the chromosome seen by snp_tab
+            tab_chrom=cur_chrom
             
             sys.stderr.write("processing reads\n")
+
+        # when a read is "fake"  (read name: orginal_name.chrom.pos-pos, name can have "." ) check whether it matches to the same chromosome and positions as original, otherwise discard
+        l = str.split(read.qname, sep=".")         
+        if len(l) >= 3 and "-" in l[-1]:      
+            if l[-2] != read.reference_name:
+                read_stats.discard_different_chromosome += 1
+                continue
+            coord = str.split(l[-1], sep="-")
+            lpos = [int(x) for x in coord]
+            if files.is_paired: ## input of paired reads
+                if not read.is_paired:
+                    continue
+                if not read.is_proper_pair:
+                    continue            
+                if read.pos+1 < lpos[0] or read.pos+1 > lpos[1]:
+                    read_stats.discard_different_position += 1
+                    continue
+
+            else: ## single end
+
+                if read.pos+1 != lpos[0]: # single read not matching to original position
+                       read_stats.discard_different_position += 1
+                       continue
 
         if read.is_secondary:
             # this is a secondary alignment (i.e. read was aligned more than
@@ -509,11 +523,6 @@ def filter_reads(files):
                                          "do not match for pair %s\n" %
                                          read.qname)
                     else:
-                        # if 23115001 in read1.get_reference_positions() or 23115001 in read2.get_reference_positions():
-                        #     print(read1.qname)
-                        #     break
-                        # if read.qname == 'ERR188315.9027537':
-                        #     break
                         process_paired_read(read1, read2, read_stats, files, snp_tab)
                         
 
@@ -540,24 +549,18 @@ def filter_reads(files):
 
     read_stats.write(sys.stderr)
 
-    # process dic into data frame for saving
-    df = pd.DataFrame(columns=["POS",  "CHROM", "REF", "ALT", "NREF", "NALT"])
-    for key in dic:  
-        tempDF = pd.DataFrame(np.hstack((dic[key].snp_pos[:,None])), columns=["POS"]) 
-        tempDF['CHROM'] =  key
-        tempDF["REF"] = dic[key].snp_allele1.astype('U13')
-        tempDF["ALT"] = dic[key].snp_allele2.astype('U13')
-        tempDF['NREF'] = dic[key].snp_na1
-        tempDF['NALT'] = dic[key].snp_na2
-          
-        df = df.append(tempDF)
-    df.set_index(["CHROM", "POS"], inplace = True)
-    df.sort_index(inplace=True)
-    
-    
-    #df.to_pickle(files.initial_AI_pickle)
-    df.to_csv(files.post_remapping_AI_txt, sep=" ", index=True)
+    # save last snp_tab object output if it has not been saved above (when tab_chrom is not in seen_chrom_tab I didnt save the last snp_tab object)
 
+    if tab_chrom not in seen_chrom_tab:
+        DF = pd.DataFrame(np.hstack((snp_tab.snp_pos[:,None])), columns=["POS"]) 
+        DF['CHROM'] =  tab_chrom
+        DF["REF"] = snp_tab.snp_allele1.astype('U13')
+        DF["ALT"] = snp_tab.snp_allele2.astype('U13')
+        DF['NREF'] = snp_tab.snp_na1
+        DF['NALT'] = snp_tab.snp_na2
+        DF.set_index(["CHROM", "POS"], inplace = True)
+        with open(files.post_remapping_AI_filename, 'a') as f:
+            DF.to_csv(f, header=False, index=True, sep=" ")
 
 
 def slice_read(read, indices):
@@ -679,42 +682,3 @@ if __name__ == '__main__':
          snp_dir=options.snp_dir)
 
 
-# bam_filenames = "/mrc-bsu/scratch/ev250/EGEUV1/quant/refbias/STAR2/HG00120/Aligned.sortedByCoord.out.bam"
-# bam_filenames = "/mrc-bsu/scratch/ev250/EGEUV1/quant/refbias/inputs/bam/HG00120.chrom22.MapUnique.bam"
-
-# is_sorted=True
-# is_paired_end =True
-# output_dir="/mrc-bsu/scratch/ev250/EGEUV1/quant/refbias"
-# snp_dir="/mrc-bsu/scratch/ev250/EGEUV1/quant/refbias/inputs/fSNP"
-# base_qual = 10
-
-#/mrc-bsu/scratch/ev250/EGEUV1/RNA_seq_fastq
-# 'ERR188091.16512776'
-# zcat HG00256.chrom22.MapUnique.remap.fq1.gz | awk 'NR==418282'
-# CACGGACCTGCCAACATGGGGCGCGTTCGGACCAAAACCGTGAAGAAGGCGGCCCGGGTCATCATAGAAAAGGACC
-# zcat HG00256.chrom22.MapUnique.remap.fq2.gz | awk 'NR==418282'
-# CGGAGCTTTTTGCTGGGGATAATGGCGATCTCCTCGCACACGCGCTTGTTCGTGTGGGAGTCGTTGCCGAGGCGCG
-
-# zcat ERR188091_1.fastq.gz | awk 'NR==66051102'
-# CGGAGCTTTTTGCTGGGGATAATGGCGATCTCCTCGCACACGCGCTTGTTCGTGTGGGAGTCGTTGCCGAGGCGCG
-
-# zcat ERR188091_2.fastq.gz | awk 'NR==66051102' 
-# CACGGACCTGCCAACATGGGGCGCGTTCGGACCAAAACCGTGAAGAAGGCGGCCCGGGTCATCATAGAAAAGGACC
-
-# # bam file STAR2
-# CGGAGCTTTTTGCTGGGGATAATGGCGATCTCCTCGCACACGCGCTTGTTCGTGTGGGAGTCGTTGCCGAGGCGCG #read1
-# GGTCCTTTTCTATGATGACCCGGGCCGCCTTCTTCACGGTTTTGGTCCGAACGCGCCCCATGTTGGCAGGTCCGTG #read2 rev-comp
-
-# # bam file input
-# CACGGACCTGCCAACATGGGGCGCGTTCGGACCAAAACCGTGAAGAAGGCGGCCCGGGTCATCATAGAAAAGGACC #read2
-# CGCGCCTCGGCAACGACTCCCACACGAACAAGCGCGTGTGCGAGGAGATCGCCATTATCCCCAGCAAAAAGCTCCG #read1 rev-comp
-
-
-## single reads
-# bam_filenames = "/mrc-bsu/scratch/ev250/psoriasis/refbias/STAR2/SRR1146233/Aligned.sortedByCoord.out.bam"
-# is_sorted=True
-# is_paired_end =False
-# output_dir="/mrc-bsu/scratch/ev250/psoriasis/refbias"
-# snp_dir="/mrc-bsu/scratch/ev250/psoriasis/refbias/inputs/fSNP"
-
- 

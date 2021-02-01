@@ -24,12 +24,15 @@ def parse_options():
 
 
 def count_reads_snp(files):
-    
-    dfs = [pd.read_csv(f, sep = " ") for f in files]
-    for df in dfs:
+    """Avoid memeory use by reading each file at a time"""
+    comb = None
+    for f in files:
+        df = pd.read_csv(f, sep = " ")
         df.set_index(["CHROM", "POS", "REF", "ALT"], inplace = True)
-
-    comb = reduce(lambda x, y: x.add(y), dfs)
+        if comb is None:
+            comb = df.copy()
+        else:
+            comb = reduce(lambda x, y: x.add(y), [comb, df])
 
     comb['Total'] = comb['NREF'] + comb['NALT']
     

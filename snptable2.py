@@ -190,7 +190,6 @@ class SNPTable(object):
                     
                     for offset in offsets:
                         read_pos = offset + read_start
-                        
                         allele1 = self.snp_allele1[s_idx[offset]]
                         allele2 = self.snp_allele2[s_idx[offset]]
                         if self.is_snp(allele1, allele2):
